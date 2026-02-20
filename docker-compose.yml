@@ -1,0 +1,195 @@
+services:
+  # ========================= KAFKA =========================
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+      KAFKA_OPTS: "-Dzookeeper.4lw.commands.whitelist=ruok,srvr,stat"
+    networks:
+      - pipeline
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost 2181 | grep imok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    networks:
+      - pipeline
+    healthcheck:
+      test: kafka-broker-api-versions --bootstrap-server localhost:29092
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    container_name: kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+    networks:
+      - pipeline
+
+  # ========================= MINIO (S3 Data Lake) =========================
+  minio:
+    image: minio/minio:RELEASE.2024-06-13T22-53-53Z
+    container_name: minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data
+    networks:
+      - pipeline
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio-init:
+    image: minio/mc:RELEASE.2024-06-12T14-34-03Z
+    container_name: minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set myminio http://minio:9000 minioadmin minioadmin123 &&
+        mc mb --ignore-existing myminio/warehouse &&
+        mc mb --ignore-existing myminio/iceberg &&
+        mc mb --ignore-existing myminio/checkpoints &&
+        echo 'Buckets created'
+      "
+    networks:
+      - pipeline
+
+  # ========================= SPARK =========================
+  spark-master:
+      image: apache/spark:3.5.4
+      container_name: spark-master
+      command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+      ports:
+        - "7077:7077"
+        - "8081:8080"
+        - "4040:4040"
+      environment:
+        SPARK_MASTER_HOST: spark-master
+      networks:
+        - pipeline
+
+  spark-worker:
+      image: apache/spark:3.5.4
+      container_name: spark-worker
+      command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+      depends_on:
+        - spark-master
+      environment:
+        SPARK_WORKER_MEMORY: 2g
+        SPARK_WORKER_CORES: 2
+      networks:
+        - pipeline
+  # ========================= CLICKHOUSE =========================
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.1
+    container_name: clickhouse
+    ports:
+      - "8123:8123"
+      - "9440:9000"
+    environment:
+      CLICKHOUSE_DB: ecommerce
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: clickhouse123
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    networks:
+      - pipeline
+    healthcheck:
+      test: clickhouse-client --password clickhouse123 --query "SELECT 1"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ========================= METABASE (BI) =========================
+  metabase:
+    image: metabase/metabase:v0.50.21
+    container_name: metabase
+    ports:
+      - "3000:3000"
+    environment:
+      MB_DB_TYPE: h2
+      MB_DB_FILE: /metabase-data/metabase.db
+      JAVA_TOOL_OPTIONS: "-Xmx1g"
+    volumes:
+      - metabase-data:/metabase-data
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    networks:
+      - pipeline
+
+  # ========================= dbt =========================
+  dbt:
+    build:
+      context: .
+      dockerfile: docker/dbt.Dockerfile
+    container_name: dbt
+    volumes:
+      - ./dbt:/usr/app/dbt
+    working_dir: /usr/app/dbt
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    environment:
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: 8123
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: clickhouse123
+      CLICKHOUSE_DB: ecommerce
+    networks:
+      - pipeline
+
+volumes:
+  minio-data:
+  clickhouse-data:
+  metabase-data:
+
+networks:
+  pipeline:
+    driver: bridge
